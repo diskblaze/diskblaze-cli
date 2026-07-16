@@ -5,7 +5,7 @@ Command-line client for [DiskBlaze](https://diskblaze.com) storage.
 ## Install
 
 ```bash
-pip install diskblaze
+pip install git+https://github.com/diskblaze/diskblaze-cli
 ```
 
 ## Log in
