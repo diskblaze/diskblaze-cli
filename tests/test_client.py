@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import posixpath
 from pathlib import Path
 from unittest.mock import MagicMock
 
@@ -47,7 +48,11 @@ def test_is_retryable_ignores_business_errors():
 def test_ensure_folder_creates_nested_segment_under_namespace():
     class Recorder(DiskBlazeClient):
         def __init__(self):
+            super().__init__(token="dummy")
             self.created: list[str] = []
+
+        def list_files(self, path: str = "/"):
+            return []
 
         def create_folder(self, path: str) -> FileNode:
             self.created.append(path)
@@ -73,7 +78,11 @@ def test_ensure_folder_creates_nested_segment_under_namespace():
 def test_ensure_folder_creates_full_nested_chain():
     class Recorder(DiskBlazeClient):
         def __init__(self):
+            super().__init__(token="dummy")
             self.created: list[str] = []
+
+        def list_files(self, path: str = "/"):
+            return []
 
         def create_folder(self, path: str) -> FileNode:
             self.created.append(path)
@@ -109,7 +118,7 @@ class FakeUploadClient(DiskBlazeClient):
         self.uploaded = bytearray()
         self.completed: list[dict] = []
 
-    def ensure_folder(self, path: str) -> None:
+    def ensure_folder(self, path: str, *, no_create: bool = False) -> None:
         self.created_folders.append(path)
 
     def create_upload_plan(
@@ -191,7 +200,7 @@ class FakeMultipartClient(DiskBlazeClient):
         self.completed_parts: list[dict] | None = None
         self.plan_size = 0
 
-    def ensure_folder(self, path: str) -> None:
+    def ensure_folder(self, path: str, *, no_create: bool = False) -> None:
         pass
 
     def create_upload_plan(self, path, *, size_bytes, content_sha256=None, part_size=None):
@@ -577,3 +586,84 @@ def test_verbose_count_zero_is_silent():
     finally:
         logger.handlers = []
         logger.setLevel(logging.NOTSET)
+
+
+class FakeFolderClient(DiskBlazeClient):
+    """Exercises ensure_folder's existence checks without any network."""
+
+    def __init__(self):
+        super().__init__(token="dummy")
+        self.created: list[str] = []
+        self.existing: set[str] = set()
+        self.list_calls: list[str] = []
+
+    def create_folder(self, path: str) -> FileNode:
+        self.created.append(path)
+        self.existing.add(path)
+        return FileNode(
+            id="x",
+            name=posixpath.basename(path),
+            path=path,
+            parent_path=posixpath.dirname(path),
+            is_dir=True,
+            size_bytes=0,
+            size="0 B",
+            updated_at="",
+            readonly=False,
+            content_sha256=None,
+        )
+
+    def list_files(self, path: str = "/"):
+        self.list_calls.append(path)
+        return [
+            FileNode(
+                id="d",
+                name=posixpath.basename(p),
+                path=p,
+                parent_path=posixpath.dirname(p),
+                is_dir=True,
+                size_bytes=0,
+                size="0 B",
+                updated_at="",
+                readonly=False,
+                content_sha256=None,
+            )
+            for p in self.existing
+            if posixpath.dirname(p) == normalize_remote_path(path)
+        ]
+
+
+def test_ensure_folder_skips_existing_and_caches(tmp_path):
+    client = FakeFolderClient()
+    # Pre-existing folder tree on the server.
+    client.existing = {"/public/dest", "/public/dest/sub"}
+    # Two files in the same parent: ensure_folder must not call create_folder
+    # for an already-present folder, and must probe the parent only once.
+    client.ensure_folder("/public/dest/sub")
+    client.ensure_folder("/public/dest/sub")
+    assert client.created == []
+    # Existence probes list each parent once; both calls are served from cache.
+    assert client.list_calls == ["/public", "/public/dest"]
+    assert client.folder_exists("/public/dest/sub") is True
+
+
+def test_ensure_folder_creates_missing_then_caches(tmp_path):
+    client = FakeFolderClient()
+    client.ensure_folder("/public/dest/sub")
+    # All missing ancestor segments are created (none pre-existed).
+    assert client.created == ["/public/dest", "/public/dest/sub"]
+    # A second call for the same path does not re-create or re-probe.
+    client.ensure_folder("/public/dest/sub")
+    assert client.created == ["/public/dest", "/public/dest/sub"]
+    # The parents were probed exactly once across both calls.
+    assert client.list_calls == ["/public", "/public/dest"]
+
+
+def test_ensure_folder_no_create_skips_creation(tmp_path):
+    client = FakeFolderClient()
+    # Folders are assumed present; create_folder is never invoked even though
+    # folder_exists would report them missing.
+    client.ensure_folder("/public/dest/sub", no_create=True)
+    assert client.created == []
+    # list_files is still consulted per segment (to verify), but no mutation.
+    assert client.list_calls == ["/public", "/public/dest"]

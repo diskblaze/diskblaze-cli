@@ -274,6 +274,7 @@ def command_upload(args: argparse.Namespace) -> int:
                 file_workers=args.file_workers,
                 checksum=not args.no_sha256,
                 skip_existing=args.skip_existing,
+                no_create_folders=args.no_create_folders,
                 progress=mux,
             )
             console.print(f"[green]uploaded[/green] {len(result)} files to {remote}")
@@ -284,6 +285,7 @@ def command_upload(args: argparse.Namespace) -> int:
                 workers=args.workers,
                 part_size=args.part_size,
                 checksum=not args.no_sha256,
+                no_create_folders=args.no_create_folders,
                 progress=mux,
             )
             console.print(f"[green]uploaded[/green] {node.path} ({node.size})")
@@ -436,6 +438,11 @@ def build_parser() -> argparse.ArgumentParser:
         "--skip-existing",
         action="store_true",
         help="Skip files whose remote parent already has a file with the same name and byte size (resume).",
+    )
+    upload_cmd.add_argument(
+        "--no-create-folders",
+        action="store_true",
+        help="Assume target folders already exist; skip all createFolder calls (fails if a parent is missing).",
     )
     upload_cmd.set_defaults(func=command_upload)
 

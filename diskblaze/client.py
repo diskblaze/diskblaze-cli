@@ -395,6 +395,11 @@ class DiskBlazeClient:
         # Bound the number of in-flight GraphQL calls so a wide upload tree
         # doesn't overload it. Actual byte transfers are unaffected.
         self.graphql_semaphore = threading.Semaphore(max(1, int(graphql_concurrency)))
+        # Cache of folder existence (path -> exists?) so ensure_folder doesn't
+        # re-issue a createFolder (or an existence probe) for a path it has
+        # already resolved. The GraphQL control plane is the slow bottleneck,
+        # so avoiding redundant calls matters for wide trees.
+        self._folder_cache: dict[str, bool] = {}
 
     def _data_timeout(self):
         """Timeout tuple for data-plane requests (connect, read).
@@ -504,7 +509,37 @@ class DiskBlazeClient:
         data = self.graphql(CREATE_FOLDER, {"path": normalize_remote_path(path)})
         return _node_from_payload(data["createFolder"])
 
-    def ensure_folder(self, path: str) -> None:
+    def folder_exists(self, path: str) -> bool:
+        """Return True if ``path`` is an existing folder, using a cached probe.
+
+        Probes the parent directory listing once and checks for a directory
+        node with a matching name, so repeated checks for the same folder (and
+        its ancestors) cost at most one GraphQL call each.
+        """
+        if not hasattr(self, "_folder_cache"):
+            self._folder_cache = {}
+        normalized = normalize_remote_path(path)
+        if normalized in {"/", "/private", "/public", "/inbox", "/shared"}:
+            return True
+        if normalized in self._folder_cache:
+            return self._folder_cache[normalized]
+        parent = posixpath.dirname(normalized)
+        name = posixpath.basename(normalized)
+        try:
+            for node in self.list_files(parent):
+                if node.is_dir and node.name == name:
+                    self._folder_cache[normalized] = True
+                    return True
+        except DiskBlazeError:
+            # Parent may be inaccessible; treat as not-found rather than failing
+            # the whole upload. create_folder will surface a real error if so.
+            pass
+        self._folder_cache[normalized] = False
+        return False
+
+    def ensure_folder(self, path: str, *, no_create: bool = False) -> None:
+        if not hasattr(self, "_folder_cache"):
+            self._folder_cache = {}
         normalized = normalize_remote_path(path)
         if normalized in {"/", "/private", "/public", "/inbox", "/shared"}:
             logger.debug("ensure_folder %s -> root, nothing to create", normalized)
@@ -517,16 +552,28 @@ class DiskBlazeClient:
             # to (re)create it, but still create every deeper segment.
             if current.count("/") == 1 and part in roots:
                 continue
+            # Skip the createFolder round-trip when we already know the folder
+            # exists (or when the caller asserts it does via no_create).
+            if self._folder_cache.get(current, None):
+                continue
+            if no_create:
+                if not self.folder_exists(current):
+                    logger.debug("ensure_folder %s assumed present (no_create), not verified", current)
+                continue
+            if self.folder_exists(current):
+                continue
             try:
                 logger.debug("ensure_folder creating %s", current)
                 self.create_folder(current)
+                self._folder_cache[current] = True
             except DiskBlazeError as exc:
                 lowered = str(exc).lower()
-                # Only swallow a genuine "already exists" race; a transient
-                # error would already have been retried by graphql(), so any
-                # other message is a real failure we must surface.
+                # Only swallow a genuine "already exists" race (e.g. a concurrent
+                # upload created it first); a transient error would already have
+                # been retried by graphql(), so any other message is real.
                 if "already exists" in lowered or "already exist" in lowered or "conflict" in lowered:
                     logger.debug("ensure_folder %s already exists, skipping", current)
+                    self._folder_cache[current] = True
                     continue
                 raise
 
@@ -605,6 +652,7 @@ class DiskBlazeClient:
         part_size: int | None = None,
         checksum: bool = False,
         ensure_parent: bool = True,
+        no_create_folders: bool = False,
         executor: ThreadPoolExecutor | None = None,
         progress: ProgressCallback | None = None,
     ) -> FileNode:
@@ -614,7 +662,7 @@ class DiskBlazeClient:
         logger.debug("upload_file %s -> %s (%d bytes, workers=%d, checksum=%s)", path, remote, size, workers, checksum)
         parent = posixpath.dirname(remote)
         if ensure_parent and parent and parent != "/":
-            self.ensure_folder(parent)
+            self.ensure_folder(parent, no_create=no_create_folders)
         # Compute the checksum only after the parent folder exists, so we don't
         # waste a full-file read on an auth/quota failure.
         sha256 = self.sha256(path, progress_path=remote, total=size, progress=progress) if checksum else None
@@ -747,13 +795,19 @@ class DiskBlazeClient:
         file_workers: int = 2,
         checksum: bool = False,
         skip_existing: bool = False,
+        no_create_folders: bool = False,
         progress: ProgressCallback | None = None,
     ) -> list[FileNode]:
         root = Path(local_path)
         if root.is_file():
             return [
                 self.upload_file(
-                    root, join_remote(remote_dir, root.name), workers=workers, checksum=checksum, progress=progress
+                    root,
+                    join_remote(remote_dir, root.name),
+                    workers=workers,
+                    checksum=checksum,
+                    no_create_folders=no_create_folders,
+                    progress=progress,
                 )
             ]
         # Enumerate with followlinks=False so a symlink into a large tree is
@@ -823,6 +877,7 @@ class DiskBlazeClient:
                         workers=workers,
                         checksum=checksum,
                         ensure_parent=True,
+                        no_create_folders=no_create_folders,
                         executor=executor,
                         progress=progress,
                     )
