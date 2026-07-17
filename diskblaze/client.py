@@ -400,6 +400,7 @@ class DiskBlazeClient:
         # already resolved. The GraphQL control plane is the slow bottleneck,
         # so avoiding redundant calls matters for wide trees.
         self._folder_cache: dict[str, bool] = {}
+        self._listed_parents: set[str] = set()
 
     def _data_timeout(self):
         """Timeout tuple for data-plane requests (connect, read).
@@ -512,30 +513,36 @@ class DiskBlazeClient:
     def folder_exists(self, path: str) -> bool:
         """Return True if ``path`` is an existing folder, using a cached probe.
 
-        Probes the parent directory listing once and checks for a directory
-        node with a matching name, so repeated checks for the same folder (and
-        its ancestors) cost at most one GraphQL call each.
+        Probes each parent directory listing at most once and records the
+        existence of every folder it contains, so checking many siblings under
+        the same parent (the common case for an upload tree) costs a single
+        GraphQL call instead of one per file.
         """
         if not hasattr(self, "_folder_cache"):
             self._folder_cache = {}
+        if not hasattr(self, "_listed_parents"):
+            self._listed_parents = set()
         normalized = normalize_remote_path(path)
         if normalized in {"/", "/private", "/public", "/inbox", "/shared"}:
             return True
         if normalized in self._folder_cache:
             return self._folder_cache[normalized]
-        parent = posixpath.dirname(normalized)
-        name = posixpath.basename(normalized)
-        try:
-            for node in self.list_files(parent):
-                if node.is_dir and node.name == name:
-                    self._folder_cache[normalized] = True
-                    return True
-        except DiskBlazeError:
-            # Parent may be inaccessible; treat as not-found rather than failing
-            # the whole upload. create_folder will surface a real error if so.
-            pass
-        self._folder_cache[normalized] = False
-        return False
+        parent = normalize_remote_path(posixpath.dirname(normalized))
+        # The first time we look inside a parent, list it once and cache the
+        # existence of every directory it holds. Subsequent siblings (and even
+        # the same folder re-checked) then hit the cache with no extra call.
+        if parent not in self._listed_parents:
+            self._listed_parents.add(parent)
+            try:
+                for node in self.list_files(parent):
+                    if node.is_dir:
+                        self._folder_cache[normalize_remote_path(node.path)] = True
+            except DiskBlazeError:
+                # Parent may be inaccessible; treat its children as not-found
+                # rather than failing the whole upload. create_folder surfaces
+                # a real error if the folder truly cannot be made.
+                pass
+        return bool(self._folder_cache.get(normalized, False))
 
     def ensure_folder(self, path: str, *, no_create: bool = False) -> None:
         if not hasattr(self, "_folder_cache"):
