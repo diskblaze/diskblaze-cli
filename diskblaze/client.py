@@ -315,6 +315,7 @@ class DiskBlazeClient:
         token: str | None = None,
         timeout: float = 120.0,
         pool_size: int = 64,
+        graphql_concurrency: int = 8,
     ):
         self.endpoint = (endpoint or os.environ.get("DISKBLAZE_GQL_URL") or DEFAULT_ENDPOINT).rstrip("/")
         self.token = token or os.environ.get("DISKBLAZE_TOKEN") or os.environ.get("DISKBLAZE_API_KEY")
@@ -324,6 +325,12 @@ class DiskBlazeClient:
         self.pool_size = int(pool_size)
         self._headers = {"Authorization": f"Bearer {self.token}"}
         self.session = self._new_session()
+        # The GraphQL endpoint is the bottleneck for control-plane calls
+        # (createUploadPlan, createFolder): it is far slower than the S3 data
+        # plane and returns 500s when hammered by many concurrent requests.
+        # Bound the number of in-flight GraphQL calls so a wide upload tree
+        # doesn't overload it. Actual byte transfers are unaffected.
+        self.graphql_semaphore = threading.Semaphore(max(1, int(graphql_concurrency)))
 
     def _new_session(self) -> requests.Session:
         session = requests.Session()
@@ -344,13 +351,17 @@ class DiskBlazeClient:
         # for its own TLS handshake. requests.Session is thread-safe for this.
         return self.session
 
+    def graphql(self, query: str, variables: dict | None = None) -> dict:
+        with self.graphql_semaphore:
+            return self._graphql(query, variables)
+
     @retry(
         retry=retry_if_exception(_is_retryable),
         wait=wait_exponential_jitter(initial=0.5, max=8),
         stop=stop_after_attempt(4),
         reraise=True,
     )
-    def graphql(self, query: str, variables: dict | None = None) -> dict:
+    def _graphql(self, query: str, variables: dict | None = None) -> dict:
         response = self._session().post(
             self.endpoint,
             json={"query": query, "variables": variables or {}},
@@ -648,20 +659,17 @@ class DiskBlazeClient:
                 )
             ]
         files = [path for path in root.rglob("*") if path.is_file()]
-        dirs = {normalize_remote_path(remote_dir)}
-        for dir_path in (path for path in root.rglob("*") if path.is_dir()):
-            dirs.add(join_remote(remote_dir, dir_path.relative_to(root).as_posix()))
-        for file_path in files:
-            parent = file_path.relative_to(root).parent.as_posix()
-            if parent and parent != ".":
-                dirs.add(join_remote(remote_dir, parent))
-        for remote_folder in sorted(dirs, key=lambda item: item.count("/")):
-            self.ensure_folder(remote_folder)
         results: list[FileNode] = []
         # A single shared executor bounds total concurrency to file_workers * workers
         # instead of file_workers threads each spinning up their own 'workers' pool
         # (which would multiply to file_workers * workers part threads). Per-file
         # part uploads draw from this same pool via the 'executor' argument.
+        #
+        # Folders are NOT pre-created up front: the GraphQL createFolder mutation is
+        # slow (~seconds per call, server-serialized), so a tree of hundreds of
+        # folders would stall for minutes before the first byte moved. Instead each
+        # upload_file ensures its own parent on the worker thread, so folder
+        # creation overlaps with the uploads and the first transfer starts immediately.
         total_workers = max(1, int(file_workers)) * max(1, int(workers))
         with ThreadPoolExecutor(max_workers=total_workers, thread_name_prefix="diskblaze-upload") as executor:
             futures = {}
@@ -675,7 +683,7 @@ class DiskBlazeClient:
                         remote_path,
                         workers=workers,
                         checksum=checksum,
-                        ensure_parent=False,
+                        ensure_parent=True,
                         executor=executor,
                         progress=progress,
                     )

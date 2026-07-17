@@ -96,11 +96,17 @@ def build_client(args: argparse.Namespace) -> DiskBlazeClient:
     # Bound total concurrency so --workers 64 --file-workers 8 can't open 520
     # connections. Total live HTTP connections are capped by file_workers*workers.
     total = min(workers * file_workers, 32)
+    # Control-plane (GraphQL) calls are far slower than S3 transfers and the
+    # endpoint 500s under heavy concurrency, so cap them independently of the
+    # data-plane workers. More file_workers means more simultaneous plan/folder
+    # calls, so scale the GraphQL cap with it (bounded).
+    graphql_concurrency = max(4, min(file_workers, 16))
     return DiskBlazeClient(
         endpoint=endpoint,
         token=token,
         timeout=args.timeout,
         pool_size=max(total + 8, 32),
+        graphql_concurrency=graphql_concurrency,
     )
 
 
