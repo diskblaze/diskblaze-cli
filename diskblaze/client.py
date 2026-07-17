@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import contextlib
 import hashlib
+import logging
 import os
 import posixpath
 import threading
@@ -21,6 +22,22 @@ from tenacity import (
     stop_after_attempt,
     wait_exponential_jitter,
 )
+
+logger = logging.getLogger("diskblaze")
+
+
+def _graphql_op_name(query: str) -> str:
+    """Best-effort extraction of the operation/mutation name for log lines."""
+    for token in query.replace("(", " ").replace("{", " ").split():
+        if token in {
+            "query",
+            "mutation",
+            "subscription",
+        }:
+            continue
+        return token
+    return "graphql"
+
 
 DEFAULT_ENDPOINT = "https://diskblaze.com/graphql"
 MiB = 1024 * 1024
@@ -250,6 +267,10 @@ query Me {
 def normalize_remote_path(path: str) -> str:
     value = "/" + str(path or "/").strip().lstrip("/")
     normalized = posixpath.normpath(value)
+    # Reject path traversal that escapes the root: a ".." that collapses past
+    # the leading "/" leaves a leading ".." in the result.
+    if normalized == ".." or normalized.startswith("../"):
+        raise DiskBlazeError(f"invalid remote path (escapes root): {path!r}")
     return "/" if normalized == "." else normalized
 
 
@@ -345,13 +366,27 @@ class DiskBlazeClient:
         timeout: float = 120.0,
         pool_size: int = 64,
         graphql_concurrency: int = 8,
+        transfer_timeout: float = 0.0,
     ):
         self.endpoint = (endpoint or os.environ.get("DISKBLAZE_GQL_URL") or DEFAULT_ENDPOINT).rstrip("/")
         self.token = token or os.environ.get("DISKBLAZE_TOKEN") or os.environ.get("DISKBLAZE_API_KEY")
         if not self.token:
             raise DiskBlazeError("DISKBLAZE_TOKEN or DISKBLAZE_API_KEY is required")
+        logger.debug(
+            "DiskBlazeClient init endpoint=%s timeout=%.1f pool=%d graphql_concurrency=%d transfer_timeout=%.1f",
+            self.endpoint,
+            float(timeout),
+            int(pool_size),
+            max(1, int(graphql_concurrency)),
+            float(transfer_timeout),
+        )
         self.timeout = float(timeout)
         self.pool_size = int(pool_size)
+        # Wall-clock cap on a single file transfer (upload or download). The
+        # requests timeout is per-idle-read, so a connection that dribbles a few
+        # bytes every minute never trips it and a file can hang "completing"
+        # forever on a stalled link. transfer_timeout=0 disables the cap.
+        self.transfer_timeout = float(transfer_timeout)
         self._headers = {"Authorization": f"Bearer {self.token}"}
         self.session = self._new_session()
         # The GraphQL endpoint is the bottleneck for control-plane calls
@@ -360,6 +395,20 @@ class DiskBlazeClient:
         # Bound the number of in-flight GraphQL calls so a wide upload tree
         # doesn't overload it. Actual byte transfers are unaffected.
         self.graphql_semaphore = threading.Semaphore(max(1, int(graphql_concurrency)))
+
+    def _data_timeout(self):
+        """Timeout tuple for data-plane requests (connect, read).
+
+        When ``transfer_timeout`` is set it is applied as the *read* timeout so a
+        single stalled socket read (no bytes for ``transfer_timeout`` seconds)
+        trips even mid-chunk -- the per-idle ``self.timeout`` alone would not,
+        because a connection that dribbles a few bytes keeps the idle timer
+        satisfied. A value of 0 disables the wall-clock cap (falls back to the
+        default idle timeout).
+        """
+        if self.transfer_timeout > 0:
+            return (self.timeout, self.transfer_timeout)
+        return self.timeout
 
     def _new_session(self) -> requests.Session:
         session = requests.Session()
@@ -381,6 +430,8 @@ class DiskBlazeClient:
         return self.session
 
     def graphql(self, query: str, variables: dict | None = None) -> dict:
+        op = _graphql_op_name(query)
+        logger.debug("graphql %s (semaphore wait)", op)
         with self.graphql_semaphore:
             return self._graphql(query, variables)
 
@@ -391,6 +442,8 @@ class DiskBlazeClient:
         reraise=True,
     )
     def _graphql(self, query: str, variables: dict | None = None) -> dict:
+        op = _graphql_op_name(query)
+        logger.debug("graphql %s -> POST %s", op, self.endpoint)
         response = self._session().post(
             self.endpoint,
             json={"query": query, "variables": variables or {}},
@@ -409,6 +462,7 @@ class DiskBlazeClient:
         return data
 
     def list_files(self, path: str = "/") -> list[FileNode]:
+        logger.debug("list_files %s", normalize_remote_path(path))
         data = self.graphql(FILES, {"path": normalize_remote_path(path)})
         return [_node_from_payload(item) for item in data["files"]["items"]]
 
@@ -453,6 +507,7 @@ class DiskBlazeClient:
     def ensure_folder(self, path: str) -> None:
         normalized = normalize_remote_path(path)
         if normalized in {"/", "/private", "/public", "/inbox", "/shared"}:
+            logger.debug("ensure_folder %s -> root, nothing to create", normalized)
             return
         roots = {"private", "public", "inbox", "shared"}
         current = ""
@@ -463,10 +518,15 @@ class DiskBlazeClient:
             if current.count("/") == 1 and part in roots:
                 continue
             try:
+                logger.debug("ensure_folder creating %s", current)
                 self.create_folder(current)
             except DiskBlazeError as exc:
                 lowered = str(exc).lower()
-                if "already exists" in lowered or "exists" in lowered or "conflict" in lowered:
+                # Only swallow a genuine "already exists" race; a transient
+                # error would already have been retried by graphql(), so any
+                # other message is a real failure we must surface.
+                if "already exists" in lowered or "already exist" in lowered or "conflict" in lowered:
+                    logger.debug("ensure_folder %s already exists, skipping", current)
                     continue
                 raise
 
@@ -492,6 +552,7 @@ class DiskBlazeClient:
         content_sha256: str | None = None,
         part_size: int | None = None,
     ) -> UploadPlan:
+        logger.debug("create_upload_plan %s (%d bytes)", normalize_remote_path(path), int(size_bytes))
         data = self.graphql(
             CREATE_UPLOAD_PLAN,
             {
@@ -550,6 +611,7 @@ class DiskBlazeClient:
         path = Path(local_path)
         size = path.stat().st_size
         remote = normalize_remote_path(remote_path)
+        logger.debug("upload_file %s -> %s (%d bytes, workers=%d, checksum=%s)", path, remote, size, workers, checksum)
         parent = posixpath.dirname(remote)
         if ensure_parent and parent and parent != "/":
             self.ensure_folder(parent)
@@ -631,6 +693,12 @@ class DiskBlazeClient:
             # The gateway occasionally aborts a multipart upload when many overlap
             # (HTTP 404 NoSuchUpload). Re-upload the parts and retry completion once
             # before giving up, since the local bytes are still valid.
+            #
+            # NOTE: there is no server-side abortUpload mutation, so an orphaned
+            # multipart upload cannot be explicitly cancelled from the client. The
+            # only recovery is to re-upload the parts and complete; the gateway
+            # garbage-collects abandoned multipart uploads server-side. We therefore
+            # never call an abort and instead rely on the completion retry below.
             attempts = 2
             while attempts:
                 attempts -= 1
@@ -678,6 +746,7 @@ class DiskBlazeClient:
         workers: int = 8,
         file_workers: int = 2,
         checksum: bool = False,
+        skip_existing: bool = False,
         progress: ProgressCallback | None = None,
     ) -> list[FileNode]:
         root = Path(local_path)
@@ -687,7 +756,37 @@ class DiskBlazeClient:
                     root, join_remote(remote_dir, root.name), workers=workers, checksum=checksum, progress=progress
                 )
             ]
-        files = [path for path in root.rglob("*") if path.is_file()]
+        # Enumerate with followlinks=False so a symlink into a large tree is
+        # not duplicated and a symlink loop cannot recurse forever. Symlink
+        # files are still uploaded (they resolve to real bytes); symlink dirs
+        # are treated as files of their own and skipped as directories.
+        files = [
+            Path(dirpath) / name
+            for dirpath, _dirnames, filenames in os.walk(root, followlinks=False)
+            for name in filenames
+        ]
+        if not files:
+            return []
+
+        # Optional resume: skip files whose remote parent already lists a file
+        # with the same name and byte size. Build one cached listing per unique
+        # parent remote dir (a handful of GraphQL calls, far cheaper than
+        # re-uploading gigabytes on an interrupted run).
+        remote_index: dict[str, dict[str, int]] = {}
+
+        def _remote_sizes(parent_remote: str) -> dict[str, int]:
+            if parent_remote not in remote_index:
+                sizes: dict[str, int] = {}
+                try:
+                    for node in self.list_files(parent_remote):
+                        if not node.is_dir:
+                            sizes[node.name] = node.size_bytes
+                except DiskBlazeError:
+                    # Parent may not exist yet; treat as "nothing to skip".
+                    pass
+                remote_index[parent_remote] = sizes
+            return remote_index[parent_remote]
+
         results: list[FileNode] = []
         # A single shared executor bounds total concurrency to file_workers * workers
         # instead of file_workers threads each spinning up their own 'workers' pool
@@ -705,6 +804,17 @@ class DiskBlazeClient:
             for file_path in files:
                 rel = file_path.relative_to(root).as_posix()
                 remote_path = join_remote(remote_dir, rel)
+                if skip_existing:
+                    parent_remote = posixpath.dirname(remote_path)
+                    remote_sizes = _remote_sizes(parent_remote)
+                    try:
+                        local_size = file_path.stat().st_size
+                    except OSError:
+                        local_size = -1
+                    if remote_sizes.get(file_path.name) == local_size:
+                        if progress:
+                            progress(TransferProgress(remote_path, local_size, local_size, "skipped", 0))
+                        continue
                 futures[
                     executor.submit(
                         self.upload_file,
@@ -733,6 +843,7 @@ class DiskBlazeClient:
         return results
 
     def download_url(self, path: str, *, expires_seconds: int = 3600) -> str:
+        logger.debug("download_url %s (ttl=%ds)", normalize_remote_path(path), expires_seconds)
         data = self.graphql(DOWNLOAD_URL, {"path": normalize_remote_path(path), "expiresSeconds": int(expires_seconds)})
         return str(data["downloadUrl"]["url"])
 
@@ -748,6 +859,8 @@ class DiskBlazeClient:
         workers: int = 8,
         expires_seconds: int = 3600,
         as_zip: bool | None = None,
+        skip_existing: bool = False,
+        expected_size: int = 0,
         progress: ProgressCallback | None = None,
     ) -> Path:
         remote = normalize_remote_path(remote_path)
@@ -759,13 +872,28 @@ class DiskBlazeClient:
             if as_zip
             else self.download_url(remote, expires_seconds=expires_seconds)
         )
-        if output.is_dir() or str(local_path).endswith(os.sep):
+        # Treat the destination as a directory when it ends with a separator, is
+        # an existing directory, or is a not-yet-created path without an
+        # extension (the caller almost certainly meant a folder to drop the file
+        # into) -- otherwise write to the exact path given.
+        is_dir_target = (
+            str(local_path).endswith(os.sep) or output.is_dir() or (not output.exists() and output.suffix == "")
+        )
+        if is_dir_target:
             name = posixpath.basename(remote.rstrip("/")) or "download"
             if as_zip and not name.endswith(".zip"):
                 name += ".zip"
             output = output / name
         output.parent.mkdir(parents=True, exist_ok=True)
-        return self._download_url(url, output, display_path=remote, workers=workers, progress=progress)
+        return self._download_url(
+            url,
+            output,
+            display_path=remote,
+            workers=workers,
+            skip_existing=skip_existing,
+            expected_size=expected_size,
+            progress=progress,
+        )
 
     def download_tree(
         self,
@@ -775,6 +903,7 @@ class DiskBlazeClient:
         workers: int = 16,
         file_workers: int = 8,
         expires_seconds: int = 3600,
+        skip_existing: bool = False,
         progress: ProgressCallback | None = None,
     ) -> list[Path]:
         """Recursively download a remote folder as normal local files.
@@ -806,13 +935,16 @@ class DiskBlazeClient:
                 output = root_local / rel
                 futures[
                     executor.submit(
-                        self.download,
-                        node.path,
-                        output,
-                        workers=workers,
-                        expires_seconds=expires_seconds,
-                        as_zip=False,
-                        progress=progress,
+                        lambda p=node.path, o=output, s=node.size_bytes: self.download(
+                            p,
+                            o,
+                            workers=workers,
+                            expires_seconds=expires_seconds,
+                            as_zip=False,
+                            skip_existing=skip_existing,
+                            progress=progress,
+                            expected_size=s,
+                        )
                     )
                 ] = node
             failures: list[tuple[str, Exception]] = []
@@ -837,8 +969,11 @@ class DiskBlazeClient:
         *,
         display_path: str,
         workers: int,
+        skip_existing: bool = False,
+        expected_size: int = 0,
         progress: ProgressCallback | None,
     ) -> Path:
+        logger.debug("download %s -> %s (workers=%d, skip_existing=%s)", display_path, output, workers, skip_existing)
         size = 0
         accepts_ranges = False
         try:
@@ -878,7 +1013,21 @@ class DiskBlazeClient:
                 if range_probe is not None:
                     with contextlib.suppress(Exception):
                         range_probe.close()
+        if not size:
+            size = int(expected_size or 0)
         ranges = accepts_ranges and size > 8 * MiB
+        # Resume/short-circuit: a complete local copy (same byte size) needs no
+        # transfer when skip_existing is set. We still download to a .part when
+        # the local file is partial, so an interrupted run picks up where it
+        # left off rather than re-fetching everything.
+        if skip_existing and output.exists() and size and output.stat().st_size == size:
+            logger.debug("download %s skipped, local copy already complete (%d bytes)", display_path, size)
+            progress and progress(TransferProgress(display_path, size, size, "skipped", 0))
+            return output
+        # Download to a sidecar .part file, then rename into place only on
+        # success. A failed or interrupted transfer is left as a .part instead
+        # of a silently-corrupt file at the final path.
+        part_path = output.with_name(output.name + ".part")
         started = time.monotonic()
         transferred = 0
         lock = threading.Lock()
@@ -892,52 +1041,107 @@ class DiskBlazeClient:
                 elapsed = max(time.monotonic() - started, 0.001)
                 progress(TransferProgress(display_path, transferred, size, "downloading", transferred / elapsed))
 
-        if ranges and workers > 1:
-            output.write_bytes(b"")
-            with output.open("r+b") as handle:
-                handle.truncate(size)
-            part_size = max(16 * MiB, min(128 * MiB, size // max(1, int(workers))))
-            ranges_to_get = [(start, min(size, start + part_size)) for start in range(0, size, part_size)]
-            range_progress: dict[int, int] = {}
+        try:
+            if ranges and workers > 1:
+                logger.debug("download %s using %d parallel ranges", display_path, max(1, int(workers)))
+                part_path.write_bytes(b"")
+                with part_path.open("r+b") as handle:
+                    handle.truncate(size)
+                part_size = max(16 * MiB, min(128 * MiB, size // max(1, int(workers))))
+                ranges_to_get = [(start, min(size, start + part_size)) for start in range(0, size, part_size)]
+                range_progress: dict[int, int] = {}
 
-            def bump_range(start: int, loaded: int) -> None:
-                nonlocal transferred
-                if not progress:
-                    return
-                with lock:
-                    range_progress[int(start)] = max(0, int(loaded))
-                    transferred = min(size, sum(range_progress.values()))
-                    elapsed = max(time.monotonic() - started, 0.001)
-                    progress(TransferProgress(display_path, transferred, size, "downloading", transferred / elapsed))
+                def bump_range(start: int, loaded: int) -> None:
+                    nonlocal transferred
+                    if not progress:
+                        return
+                    with lock:
+                        range_progress[int(start)] = max(0, int(loaded))
+                        transferred = min(size, sum(range_progress.values()))
+                        elapsed = max(time.monotonic() - started, 0.001)
+                        progress(
+                            TransferProgress(display_path, transferred, size, "downloading", transferred / elapsed)
+                        )
 
-            with ThreadPoolExecutor(
-                max_workers=max(1, int(workers)), thread_name_prefix="diskblaze-download"
-            ) as executor:
-                futures = [
-                    executor.submit(self._download_range, url, output, start, end, bump_range)
-                    for start, end in ranges_to_get
-                ]
-                for future in as_completed(futures):
-                    future.result()
-        else:
-            with self._session().get(url, stream=True, timeout=self.timeout) as response:
-                response.raise_for_status()
-                with output.open("wb") as handle:
-                    for chunk in response.iter_content(chunk_size=4 * MiB):
-                        if not chunk:
-                            continue
-                        handle.write(chunk)
-                        bump(len(chunk))
+                with ThreadPoolExecutor(
+                    max_workers=max(1, int(workers)), thread_name_prefix="diskblaze-download"
+                ) as executor:
+                    futures = [
+                        executor.submit(self._download_range, url, part_path, start, end, bump_range)
+                        for start, end in ranges_to_get
+                    ]
+                    for future in as_completed(futures):
+                        future.result()
+            else:
+                # Resume a previously-interrupted single-stream download when the
+                # server honors range requests: request only the remaining bytes
+                # and append to the existing .part instead of starting over.
+                existing = part_path.stat().st_size if part_path.exists() else 0
+                resume = bool(existing) and bool(size) and existing < size and accepts_ranges
+                if resume:
+                    transferred = existing
+                    logger.debug("download %s resuming from %d/%d bytes", display_path, existing, size)
+                get_headers: dict[str, str] = {}
+                if resume:
+                    get_headers["Range"] = f"bytes={existing}-"
+                with self._session().get(
+                    url, headers=get_headers, stream=True, timeout=self._data_timeout()
+                ) as response:
+                    response.raise_for_status()
+                    # A 206 means we're appending to a partial file; a 200 (or a
+                    # server that ignored the Range header) means start fresh.
+                    if response.status_code == 206:
+                        handle_mode = "ab"
+                    else:
+                        handle_mode = "wb"
+                        existing = 0
+                    deadline = 0.0
+                    if self.transfer_timeout > 0:
+                        deadline = time.monotonic() + self.transfer_timeout
+                    with part_path.open(handle_mode) as handle:
+                        for chunk in response.iter_content(chunk_size=4 * MiB):
+                            if not chunk:
+                                continue
+                            if deadline and time.monotonic() > deadline:
+                                raise requests.Timeout("download stalled: exceeded transfer_timeout")
+                            handle.write(chunk)
+                            bump(len(chunk))
+            os.replace(part_path, output)
+        except BaseException:
+            # Leave the .part file for inspection/resume; don't clobber a
+            # previously-good copy at the destination.
+            raise
         progress and progress(TransferProgress(display_path, size or transferred, size or transferred, "done", 0))
         return output
 
     def _put_stream(self, url: str, body: Iterable[bytes], *, length: int) -> str:
+        deadline = 0.0
+        if self.transfer_timeout > 0:
+            deadline = time.monotonic() + self.transfer_timeout
+
+        def _check_stall() -> None:
+            if deadline and time.monotonic() > deadline:
+                raise requests.Timeout("upload stalled: exceeded transfer_timeout")
+
         if length == 0:
-            response = self._session().put(url, data=b"", headers={"Content-Length": "0"}, timeout=self.timeout)
+            _check_stall()
+            response = self._session().put(url, data=b"", headers={"Content-Length": "0"}, timeout=self._data_timeout())
             response.raise_for_status()
             return response.headers.get("ETag", "").replace('"', "")
+        # The upload body is an iterator; wrap it so every chunk checks the
+        # wall-clock deadline and aborts a stalled connection.
+        body_iter = body
+
+        def guarded(body: Iterable[bytes]) -> Iterable[bytes]:
+            for chunk in body:
+                _check_stall()
+                yield chunk
+
         response = self._session().put(
-            url, data=body, headers={"Content-Length": str(int(length))}, timeout=self.timeout
+            url,
+            data=guarded(body_iter),
+            headers={"Content-Length": str(int(length))},
+            timeout=self._data_timeout(),
         )
         response.raise_for_status()
         return response.headers.get("ETag", "").replace('"', "")
@@ -977,7 +1181,10 @@ class DiskBlazeClient:
         headers = {"Range": f"bytes={start}-{end - 1}"}
         loaded = 0
         progress(start, 0)
-        with self._session().get(url, headers=headers, stream=True, timeout=self.timeout) as response:
+        deadline = 0.0
+        if self.transfer_timeout > 0:
+            deadline = time.monotonic() + self.transfer_timeout
+        with self._session().get(url, headers=headers, stream=True, timeout=self._data_timeout()) as response:
             response.raise_for_status()
             if response.status_code != 206:
                 raise DiskBlazeError("server did not honor range request")
@@ -986,6 +1193,8 @@ class DiskBlazeClient:
                 for chunk in response.iter_content(chunk_size=4 * MiB):
                     if not chunk:
                         continue
+                    if deadline and time.monotonic() > deadline:
+                        raise requests.Timeout("download stalled: exceeded transfer_timeout")
                     handle.write(chunk)
                     loaded += len(chunk)
                     progress(start, loaded)

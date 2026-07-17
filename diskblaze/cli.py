@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import getpass
 import json
+import logging
 import os
 import sys
 import threading
@@ -101,13 +102,16 @@ def build_client(args: argparse.Namespace) -> DiskBlazeClient:
     # data-plane workers. More file_workers means more simultaneous plan/folder
     # calls, so scale the GraphQL cap with it (bounded).
     graphql_concurrency = max(4, min(file_workers, 16))
-    return DiskBlazeClient(
-        endpoint=endpoint,
-        token=token,
-        timeout=args.timeout,
-        pool_size=max(total + 8, 32),
-        graphql_concurrency=graphql_concurrency,
-    )
+    kwargs: dict = {
+        "endpoint": endpoint,
+        "token": token,
+        "timeout": args.timeout,
+        "pool_size": max(total + 8, 32),
+        "graphql_concurrency": graphql_concurrency,
+    }
+    if getattr(args, "transfer_timeout", None) is not None:
+        kwargs["transfer_timeout"] = args.transfer_timeout
+    return DiskBlazeClient(**kwargs)
 
 
 def transfer_progress() -> Progress:
@@ -269,6 +273,7 @@ def command_upload(args: argparse.Namespace) -> int:
                 workers=args.workers,
                 file_workers=args.file_workers,
                 checksum=not args.no_sha256,
+                skip_existing=args.skip_existing,
                 progress=mux,
             )
             console.print(f"[green]uploaded[/green] {len(result)} files to {remote}")
@@ -298,6 +303,7 @@ def command_download(args: argparse.Namespace) -> int:
                 workers=args.workers,
                 file_workers=args.file_workers,
                 expires_seconds=args.expires,
+                skip_existing=args.skip_existing,
                 progress=mux,
             )
             console.print(f"[green]downloaded[/green] {len(paths)} files from {args.remote} -> {output}")
@@ -308,6 +314,7 @@ def command_download(args: argparse.Namespace) -> int:
                 workers=args.workers,
                 expires_seconds=args.expires,
                 as_zip=args.zip,
+                skip_existing=args.skip_existing,
                 progress=mux,
             )
             console.print(f"[green]downloaded[/green] {args.remote} -> {path}")
@@ -333,6 +340,19 @@ def add_common(parser: argparse.ArgumentParser, *, suppress_defaults: bool = Fal
     )
     parser.add_argument(
         "--file-workers", type=int, default=file_workers_default, help="Concurrent files for folder uploads/downloads."
+    )
+    parser.add_argument(
+        "--transfer-timeout",
+        type=float,
+        default=None,
+        help="Wall-clock cap (seconds) for a single file transfer. 0 disables. Catches links that stall forever.",
+    )
+    parser.add_argument(
+        "-v",
+        "--verbose",
+        action="count",
+        default=0,
+        help="Increase verbosity. -v logs operations, -vv also logs HTTP/graphql internals.",
     )
 
 
@@ -412,6 +432,11 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Skip the local SHA-256 pre-read. Faster to start, but the server may need a backend readback.",
     )
+    upload_cmd.add_argument(
+        "--skip-existing",
+        action="store_true",
+        help="Skip files whose remote parent already has a file with the same name and byte size (resume).",
+    )
     upload_cmd.set_defaults(func=command_upload)
 
     download_cmd = sub.add_parser(
@@ -425,6 +450,11 @@ def build_parser() -> argparse.ArgumentParser:
         "--recursive", "-r", action="store_true", help="Download a remote folder as normal files in parallel."
     )
     download_cmd.add_argument("--expires", type=int, default=3600, help="Signed URL TTL in seconds.")
+    download_cmd.add_argument(
+        "--skip-existing",
+        action="store_true",
+        help="Skip files already present locally with the same byte size (resume).",
+    )
     download_cmd.set_defaults(func=command_download)
 
     url_cmd = sub.add_parser("url", help="Print a signed gateway download URL.")
@@ -436,9 +466,29 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
+def _configure_logging(verbose: int) -> None:
+    """Enable diskblaze debug logging. -v logs client operations (graphql
+    calls, folder creation, plan creation, transfer start/resume); -vv also
+    logs HTTP/graphql wire traffic. Safe to call before any client work so the
+    very first GraphQL call (e.g. during build_client) is visible."""
+    if verbose <= 0:
+        return
+    handler = logging.StreamHandler(sys.stderr)
+    handler.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(name)s: %(message)s", "%H:%M:%S"))
+    root = logging.getLogger("diskblaze")
+    # Client operational logs are emitted at DEBUG; -v already turns them on.
+    root.setLevel(logging.DEBUG)
+    root.handlers = [handler]
+    if verbose >= 2:
+        # Surface the underlying HTTP library's wire traffic too.
+        logging.getLogger("requests").setLevel(logging.DEBUG)
+        logging.getLogger("urllib3").setLevel(logging.DEBUG)
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
+    _configure_logging(int(getattr(args, "verbose", 0)))
     try:
         return int(args.func(args))
     except KeyboardInterrupt:
