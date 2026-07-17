@@ -859,8 +859,15 @@ class DiskBlazeClient:
         # folders would stall for minutes before the first byte moved. Instead each
         # upload_file ensures its own parent on the worker thread, so folder
         # creation overlaps with the uploads and the first transfer starts immediately.
-        total_workers = max(1, int(file_workers)) * max(1, int(workers))
-        with ThreadPoolExecutor(max_workers=total_workers, thread_name_prefix="diskblaze-upload") as executor:
+        # The outer pool only runs the per-file orchestration (plan + complete).
+        # Each upload_file manages its OWN part-upload pool (its default when
+        # executor is None). Passing the shared executor in here caused a
+        # deadlock: orchestration threads submitted part uploads back into the
+        # same pool and all blocked waiting for slots none could free, so the
+        # whole tree stalled with zero bytes transferred and no error.
+        with ThreadPoolExecutor(
+            max_workers=max(1, int(file_workers)), thread_name_prefix="diskblaze-upload"
+        ) as executor:
             futures = {}
             for file_path in files:
                 rel = file_path.relative_to(root).as_posix()
@@ -888,7 +895,6 @@ class DiskBlazeClient:
                         checksum=checksum,
                         ensure_parent=not no_create_folders,
                         no_create_folders=no_create_folders,
-                        executor=executor,
                         progress=progress,
                     )
                 ] = file_path
