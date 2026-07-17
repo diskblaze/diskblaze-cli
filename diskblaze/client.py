@@ -30,9 +30,38 @@ class DiskBlazeError(RuntimeError):
     pass
 
 
+_TRANSIENT_ERROR_FRAGMENTS = (
+    "500",
+    "501",
+    "502",
+    "503",
+    "504",
+    "internal server error",
+    "bad gateway",
+    "service unavailable",
+    "gateway timeout",
+    "timeout",
+    "timed out",
+    "rate limit",
+    "429",
+    "too many requests",
+    "connection reset",
+    "connection aborted",
+)
+
+
 def _is_retryable(exc: BaseException) -> bool:
-    """Only retry transient errors, never business-logic DiskBlazeErrors."""
-    return isinstance(exc, requests.RequestException)
+    """Retry transient errors: network/transport failures and server-side
+    errors that the GraphQL endpoint sometimes wraps in a 200 response with an
+    ``errors`` payload (e.g. a 500 returned as a DiskBlazeError). Never retry
+    genuine business-logic rejections like "not found" or auth failures.
+    """
+    if isinstance(exc, requests.RequestException):
+        return True
+    if isinstance(exc, DiskBlazeError):
+        lowered = str(exc).lower()
+        return any(fragment in lowered for fragment in _TRANSIENT_ERROR_FRAGMENTS)
+    return False
 
 
 @dataclass(frozen=True)
@@ -358,7 +387,7 @@ class DiskBlazeClient:
     @retry(
         retry=retry_if_exception(_is_retryable),
         wait=wait_exponential_jitter(initial=0.5, max=8),
-        stop=stop_after_attempt(4),
+        stop=stop_after_attempt(5),
         reraise=True,
     )
     def _graphql(self, query: str, variables: dict | None = None) -> dict:
@@ -688,12 +717,19 @@ class DiskBlazeClient:
                         progress=progress,
                     )
                 ] = file_path
+            failures: list[tuple[str, Exception]] = []
             for future in as_completed(futures):
                 file_path = futures[future]
                 try:
                     results.append(future.result())
                 except Exception as exc:
-                    raise DiskBlazeError(f"upload failed for {file_path}: {exc}") from exc
+                    # A single file's failure (e.g. a transient 500 on
+                    # completeUpload) must not abort the rest of the batch.
+                    failures.append((str(file_path), exc))
+            if failures:
+                summary = "; ".join(f"{path}: {exc}" for path, exc in failures[:5])
+                extra = f" (+{len(failures) - 5} more)" if len(failures) > 5 else ""
+                raise DiskBlazeError(f"{len(failures)} of {len(futures)} files failed: {summary}{extra}")
         return results
 
     def download_url(self, path: str, *, expires_seconds: int = 3600) -> str:
@@ -779,12 +815,19 @@ class DiskBlazeClient:
                         progress=progress,
                     )
                 ] = node
+            failures: list[tuple[str, Exception]] = []
             for future in as_completed(futures):
                 node = futures[future]
                 try:
                     results.append(future.result())
                 except Exception as exc:
-                    raise DiskBlazeError(f"download failed for {node.path}: {exc}") from exc
+                    # A single file's failure must not abort the rest of the
+                    # batch, mirroring upload_tree's behavior.
+                    failures.append((node.path, exc))
+            if failures:
+                summary = "; ".join(f"{path}: {exc}" for path, exc in failures[:5])
+                extra = f" (+{len(failures) - 5} more)" if len(failures) > 5 else ""
+                raise DiskBlazeError(f"{len(failures)} of {len(futures)} files failed: {summary}{extra}")
         return results
 
     def _download_url(

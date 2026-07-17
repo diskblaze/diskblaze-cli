@@ -12,6 +12,7 @@ from diskblaze.client import (
     FileNode,
     UploadPart,
     UploadPlan,
+    _is_retryable,
     endpoint_from_base,
     join_remote,
     normalize_remote_path,
@@ -27,6 +28,19 @@ def test_remote_path_helpers_normalize_posix_paths():
 def test_endpoint_from_base_accepts_base_or_graphql_url():
     assert endpoint_from_base("https://diskblaze.com") == "https://diskblaze.com/graphql"
     assert endpoint_from_base("https://diskblaze.com/graphql") == "https://diskblaze.com/graphql"
+
+
+def test_is_retryable_treats_wrapped_500_as_transient():
+    assert _is_retryable(DiskBlazeError("500 Server Error: Internal Server Error for url: ..."))
+    assert _is_retryable(DiskBlazeError("502 Bad Gateway"))
+    assert _is_retryable(DiskBlazeError("503 Service Unavailable"))
+    assert _is_retryable(DiskBlazeError("rate limit exceeded"))
+
+
+def test_is_retryable_ignores_business_errors():
+    assert not _is_retryable(DiskBlazeError("not found"))
+    assert not _is_retryable(DiskBlazeError("unauthorized"))
+    assert not _is_retryable(DiskBlazeError("folders must be under /private"))
 
 
 def test_ensure_folder_creates_nested_segment_under_namespace():
@@ -273,3 +287,54 @@ def test_download_tree_uses_relative_path():
     prefix = root.rstrip("/") + "/"
     rel = nested[len(prefix) :] if nested.startswith(prefix) else nested
     assert rel == "c/d.mp3"
+
+
+class FakeDownloadClient(DiskBlazeClient):
+    def __init__(self):
+        self.files = [
+            FileNode(
+                id="1",
+                name="ok.bin",
+                path="/public/folder/ok.bin",
+                parent_path="/public/folder",
+                is_dir=False,
+                size_bytes=1,
+                size="1 B",
+                updated_at="",
+                readonly=False,
+                content_sha256=None,
+            ),
+            FileNode(
+                id="2",
+                name="bad.bin",
+                path="/public/folder/bad.bin",
+                parent_path="/public/folder",
+                is_dir=False,
+                size_bytes=1,
+                size="1 B",
+                updated_at="",
+                readonly=False,
+                content_sha256=None,
+            ),
+        ]
+
+    def list_files(self, path: str):
+        return self.files
+
+    def download(self, remote_path: str, local_path, **kwargs):
+        local_path = Path(local_path)
+        if remote_path.endswith("bad.bin"):
+            raise DiskBlazeError("500 simulated server error")
+        local_path.parent.mkdir(parents=True, exist_ok=True)
+        local_path.write_bytes(b"ok")
+        return local_path
+
+
+def test_download_tree_collects_failures_instead_of_aborting(tmp_path: Path):
+    client = FakeDownloadClient()
+    with pytest.raises(DiskBlazeError) as excinfo:
+        client.download_tree("/public/folder", tmp_path / "out")
+    assert "1 of 2 files failed" in str(excinfo.value)
+    assert "bad.bin" in str(excinfo.value)
+    # The good file still completed; the batch wasn't killed mid-way.
+    assert (tmp_path / "out" / "ok.bin").exists()
