@@ -3,15 +3,19 @@ from __future__ import annotations
 import hashlib
 from pathlib import Path
 
+import pytest
+import requests
+from diskblaze.cli import build_parser
 from diskblaze.client import (
     DiskBlazeClient,
+    DiskBlazeError,
     FileNode,
+    UploadPart,
     UploadPlan,
     endpoint_from_base,
     join_remote,
     normalize_remote_path,
 )
-from diskblaze.cli import build_parser
 
 
 def test_remote_path_helpers_normalize_posix_paths():
@@ -23,6 +27,57 @@ def test_remote_path_helpers_normalize_posix_paths():
 def test_endpoint_from_base_accepts_base_or_graphql_url():
     assert endpoint_from_base("https://diskblaze.com") == "https://diskblaze.com/graphql"
     assert endpoint_from_base("https://diskblaze.com/graphql") == "https://diskblaze.com/graphql"
+
+
+def test_ensure_folder_creates_nested_segment_under_namespace():
+    class Recorder(DiskBlazeClient):
+        def __init__(self):
+            self.created: list[str] = []
+
+        def create_folder(self, path: str) -> FileNode:
+            self.created.append(path)
+            return FileNode(
+                id="id",
+                name=path.rsplit("/", 1)[-1],
+                path=path,
+                parent_path=path.rsplit("/", 1)[0],
+                is_dir=True,
+                size_bytes=0,
+                size="0 B",
+                updated_at="",
+                readonly=False,
+                content_sha256=None,
+            )
+
+    client = Recorder()
+    client.ensure_folder("/public/dark angels")
+    assert "/public/dark angels" in client.created
+    assert "/public" not in client.created
+
+
+def test_ensure_folder_creates_full_nested_chain():
+    class Recorder(DiskBlazeClient):
+        def __init__(self):
+            self.created: list[str] = []
+
+        def create_folder(self, path: str) -> FileNode:
+            self.created.append(path)
+            return FileNode(
+                id="id",
+                name=path.rsplit("/", 1)[-1],
+                path=path,
+                parent_path=path.rsplit("/", 1)[0],
+                is_dir=True,
+                size_bytes=0,
+                size="0 B",
+                updated_at="",
+                readonly=False,
+                content_sha256=None,
+            )
+
+    client = Recorder()
+    client.ensure_folder("/private/a/b/c")
+    assert client.created == ["/private/a", "/private/a/b", "/private/a/b/c"]
 
 
 def test_cli_download_parser_has_remote_and_local_once():
@@ -42,7 +97,9 @@ class FakeUploadClient(DiskBlazeClient):
     def ensure_folder(self, path: str) -> None:
         self.created_folders.append(path)
 
-    def create_upload_plan(self, path: str, *, size_bytes: int, content_sha256: str | None = None, part_size: int | None = None):
+    def create_upload_plan(
+        self, path: str, *, size_bytes: int, content_sha256: str | None = None, part_size: int | None = None
+    ):
         self.plan_requests.append(
             {
                 "path": path,
@@ -108,3 +165,111 @@ def test_upload_file_streams_bytes_and_sends_checksum(tmp_path: Path):
         }
     ]
     assert node.content_sha256 == expected_sha
+
+
+class FakeMultipartClient(DiskBlazeClient):
+    """Simulates a multipart plan and validates part bytes + completed parts."""
+
+    def __init__(self):
+        self.uploaded_parts: dict[int, bytes] = {}
+        self.completed_parts: list[dict] | None = None
+        self.plan_size = 0
+
+    def ensure_folder(self, path: str) -> None:
+        pass
+
+    def create_upload_plan(self, path, *, size_bytes, content_sha256=None, part_size=None):
+        self.plan_size = int(size_bytes)
+        part_size = 5
+        parts = []
+        for start in range(0, int(size_bytes), part_size):
+            parts.append(
+                UploadPart(
+                    number=len(parts) + 1,
+                    start=start,
+                    end=min(start + part_size, int(size_bytes)),
+                    url=f"https://upload.invalid/part/{len(parts) + 1}",
+                )
+            )
+        return UploadPlan(
+            token="multi-token",
+            path=path,
+            size_bytes=int(size_bytes),
+            part_size=part_size,
+            upload_id="uid",
+            put_url=None,
+            parts=parts,
+        )
+
+    def _put_stream(self, url, body, *, length: int):
+        num = int(str(url).rsplit("/", 1)[1])
+        data = b"".join(body)
+        assert len(data) == length, f"part {num}: sent {len(data)} != declared {length}"
+        self.uploaded_parts[num] = data
+        return f"etag-{num}"
+
+    def complete_upload(self, token, *, completed_parts=None, content_sha256=None):
+        self.completed_parts = completed_parts
+        return FileNode(
+            id="n",
+            name="f",
+            path="/private/mp/f",
+            parent_path="/private/mp",
+            is_dir=False,
+            size_bytes=self.plan_size,
+            size=f"{self.plan_size} B",
+            updated_at="now",
+            content_sha256=content_sha256,
+        )
+
+
+def test_upload_file_multipart_streams_all_parts(tmp_path: Path):
+    data = bytes(range(256)) * 20  # 5120 bytes -> multiple 5-byte parts
+    local = tmp_path / "big.bin"
+    local.write_bytes(data)
+    client = FakeMultipartClient()
+
+    client.upload_file(local, "/private/mp/f", workers=3)
+
+    # Every byte uploaded exactly once, in order.
+    rebuilt = b"".join(client.uploaded_parts[n] for n in sorted(client.uploaded_parts))
+    assert rebuilt == data
+    # completed_parts passed to server sorted by number with etags.
+    nums = [int(p["number"]) for p in client.completed_parts]
+    assert nums == sorted(nums)
+    assert all(p["etag"].startswith("etag-") for p in client.completed_parts)
+
+
+def test_upload_file_empty_file_succeeds(tmp_path: Path):
+    local = tmp_path / "empty.bin"
+    local.write_bytes(b"")
+    client = FakeUploadClient()
+
+    node = client.upload_file(local, "/private/up/empty.bin", workers=1)
+
+    assert bytes(client.uploaded) == b""
+    assert node.size_bytes == 0
+
+
+def test_upload_file_reports_original_error(tmp_path: Path):
+    local = tmp_path / "f.bin"
+    local.write_bytes(b"x" * 10)
+
+    class BoomClient(FakeUploadClient):
+        def _put_stream(self, url, body, *, length: int):
+            raise requests.ConnectionError("simulated network down")
+
+    client = BoomClient()
+    with pytest.raises(DiskBlazeError) as excinfo:
+        client.upload_file(local, "/private/up/f.bin", workers=1)
+    # The original cause is preserved, not flattened into a bare string.
+    assert isinstance(excinfo.value.__cause__, requests.ConnectionError)
+    assert "simulated network down" in str(excinfo.value)
+
+
+def test_download_tree_uses_relative_path():
+    root = normalize_remote_path("/public/a/b")
+    nested = normalize_remote_path("/public/a/b/c/d.mp3")
+    prefix = root.rstrip("/") + "/"
+    rel = nested[len(prefix) :] if nested.startswith(prefix) else nested
+    assert rel == "c/d.mp3"

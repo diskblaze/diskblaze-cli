@@ -20,9 +20,14 @@ from rich.progress import (
 )
 from rich.table import Table
 
-from .client import DiskBlazeClient, DiskBlazeError, TransferProgress, endpoint_from_base, join_remote
 from . import config
-
+from .client import (
+    DiskBlazeClient,
+    DiskBlazeError,
+    TransferProgress,
+    endpoint_from_base,
+    join_remote,
+)
 
 console = Console()
 
@@ -47,7 +52,7 @@ class ProgressMux:
             self.progress.update(
                 task_id,
                 description=f"{event.phase} {short_path(key)}",
-                completed=min(event.transferred_bytes, max(event.total_bytes, event.transferred_bytes)),
+                completed=min(event.transferred_bytes, event.total_bytes),
                 total=max(1, event.total_bytes or event.transferred_bytes or 1),
             )
 
@@ -84,16 +89,18 @@ def resolve_token(args: argparse.Namespace) -> str | None:
 def build_client(args: argparse.Namespace) -> DiskBlazeClient:
     token = resolve_token(args)
     if not token:
-        raise DiskBlazeError(
-            "not authenticated: run `diskblaze login`, pass --token, "
-            "or set DISKBLAZE_TOKEN"
-        )
+        raise DiskBlazeError("not authenticated: run `diskblaze login`, pass --token, or set DISKBLAZE_TOKEN")
     endpoint = resolve_endpoint(args)
+    workers = max(1, int(getattr(args, "workers", 1) or 1))
+    file_workers = max(1, int(getattr(args, "file_workers", 1) or 1))
+    # Bound total concurrency so --workers 64 --file-workers 8 can't open 520
+    # connections. Total live HTTP connections are capped by file_workers*workers.
+    total = min(workers * file_workers, 32)
     return DiskBlazeClient(
         endpoint=endpoint,
         token=token,
         timeout=args.timeout,
-        pool_size=max(args.workers * max(args.file_workers, 1) + 8, 32),
+        pool_size=max(total + 8, 32),
     )
 
 
@@ -109,11 +116,7 @@ def transfer_progress() -> Progress:
 
 
 def command_login(args: argparse.Namespace) -> int:
-    token = (
-        getattr(args, "token", None)
-        or os.environ.get("DISKBLAZE_TOKEN")
-        or os.environ.get("DISKBLAZE_API_KEY")
-    )
+    token = getattr(args, "token", None) or os.environ.get("DISKBLAZE_TOKEN") or os.environ.get("DISKBLAZE_API_KEY")
     if not token:
         if not sys.stdin.isatty():
             raise DiskBlazeError("no token provided; pass --token or set DISKBLAZE_TOKEN")
@@ -310,11 +313,21 @@ def add_common(parser: argparse.ArgumentParser, *, suppress_defaults: bool = Fal
     timeout_default = argparse.SUPPRESS if suppress_defaults else 120.0
     workers_default = argparse.SUPPRESS if suppress_defaults else 64
     file_workers_default = argparse.SUPPRESS if suppress_defaults else 8
-    parser.add_argument("--endpoint", default=default, help="GraphQL endpoint or DiskBlaze base URL. Default: https://diskblaze.com/graphql")
-    parser.add_argument("--token", default=default, help="API key. Default: saved login, DISKBLAZE_TOKEN, or DISKBLAZE_API_KEY")
+    parser.add_argument(
+        "--endpoint",
+        default=default,
+        help="GraphQL endpoint or DiskBlaze base URL. Default: https://diskblaze.com/graphql",
+    )
+    parser.add_argument(
+        "--token", default=default, help="API key. Default: saved login, DISKBLAZE_TOKEN, or DISKBLAZE_API_KEY"
+    )
     parser.add_argument("--timeout", type=float, default=timeout_default)
-    parser.add_argument("--workers", type=int, default=workers_default, help="Multipart upload/download workers per file.")
-    parser.add_argument("--file-workers", type=int, default=file_workers_default, help="Concurrent files for folder uploads/downloads.")
+    parser.add_argument(
+        "--workers", type=int, default=workers_default, help="Multipart upload/download workers per file."
+    )
+    parser.add_argument(
+        "--file-workers", type=int, default=file_workers_default, help="Concurrent files for folder uploads/downloads."
+    )
 
 
 def add_command_common(parser: argparse.ArgumentParser) -> None:
@@ -352,7 +365,11 @@ def build_parser() -> argparse.ArgumentParser:
     add_command_common(search_cmd)
     search_cmd.add_argument("query", nargs="?", default="")
     search_cmd.add_argument("--path", default=None, help="Optional remote folder prefix.")
-    search_cmd.add_argument("--kind", choices=["file", "folder", "image", "video", "audio", "document", "archive", "code"], help="Optional result type filter.")
+    search_cmd.add_argument(
+        "--kind",
+        choices=["file", "folder", "image", "video", "audio", "document", "archive", "code"],
+        help="Optional result type filter.",
+    )
     search_cmd.add_argument("--min-size-bytes", type=int, default=None)
     search_cmd.add_argument("--max-size-bytes", type=int, default=None)
     search_cmd.add_argument("--updated-after", default=None, help="ISO timestamp lower bound.")
@@ -391,12 +408,16 @@ def build_parser() -> argparse.ArgumentParser:
     )
     upload_cmd.set_defaults(func=command_upload)
 
-    download_cmd = sub.add_parser("download", aliases=["dl"], help="Download a file, a folder as ZIP, or a folder recursively.")
+    download_cmd = sub.add_parser(
+        "download", aliases=["dl"], help="Download a file, a folder as ZIP, or a folder recursively."
+    )
     add_command_common(download_cmd)
     download_cmd.add_argument("remote")
     download_cmd.add_argument("local")
     download_cmd.add_argument("--zip", action="store_true", help="Request a ZIP download for a folder.")
-    download_cmd.add_argument("--recursive", "-r", action="store_true", help="Download a remote folder as normal files in parallel.")
+    download_cmd.add_argument(
+        "--recursive", "-r", action="store_true", help="Download a remote folder as normal files in parallel."
+    )
     download_cmd.add_argument("--expires", type=int, default=3600, help="Signed URL TTL in seconds.")
     download_cmd.set_defaults(func=command_download)
 

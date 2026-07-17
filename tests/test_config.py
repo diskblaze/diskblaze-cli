@@ -4,9 +4,7 @@ import argparse
 import stat
 
 import pytest
-
-from diskblaze import config
-from diskblaze import cli
+from diskblaze import cli, config
 
 
 @pytest.fixture

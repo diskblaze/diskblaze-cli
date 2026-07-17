@@ -3,8 +3,8 @@
 from __future__ import annotations
 
 from .client import (
-    CurrentUser,
     DEFAULT_ENDPOINT,
+    CurrentUser,
     DiskBlazeClient,
     DiskBlazeError,
     FileNode,
@@ -19,16 +19,16 @@ from .client import (
 __version__ = "0.1.0"
 
 __all__ = [
-    "CurrentUser",
     "DEFAULT_ENDPOINT",
+    "CurrentUser",
     "DiskBlazeClient",
     "DiskBlazeError",
     "FileNode",
     "TransferProgress",
     "UploadPart",
     "UploadPlan",
+    "__version__",
     "endpoint_from_base",
     "join_remote",
     "normalize_remote_path",
-    "__version__",
 ]
