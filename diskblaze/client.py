@@ -865,7 +865,10 @@ class DiskBlazeClient:
             for file_path in files:
                 rel = file_path.relative_to(root).as_posix()
                 remote_path = join_remote(remote_dir, rel)
-                if skip_existing:
+                if skip_existing and not no_create_folders:
+                    # When --no-create-folders is set we assume the target tree
+                    # already exists and skip the size probe entirely (no
+                    # list_files) for maximum speed; files are just uploaded.
                     parent_remote = posixpath.dirname(remote_path)
                     remote_sizes = _remote_sizes(parent_remote)
                     try:
@@ -883,7 +886,7 @@ class DiskBlazeClient:
                         remote_path,
                         workers=workers,
                         checksum=checksum,
-                        ensure_parent=True,
+                        ensure_parent=not no_create_folders,
                         no_create_folders=no_create_folders,
                         executor=executor,
                         progress=progress,

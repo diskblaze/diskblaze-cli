@@ -263,6 +263,8 @@ def command_upload(args: argparse.Namespace) -> int:
     if not local.exists():
         raise DiskBlazeError(f"local path does not exist: {local}")
     remote = args.remote or join_remote("/private", local.name)
+    # --fast = assume the remote tree exists and skip every control-plane probe.
+    no_create = bool(args.no_create_folders or args.fast)
     progress = transfer_progress()
     with progress:
         mux = ProgressMux(progress)
@@ -274,7 +276,7 @@ def command_upload(args: argparse.Namespace) -> int:
                 file_workers=args.file_workers,
                 checksum=not args.no_sha256,
                 skip_existing=args.skip_existing,
-                no_create_folders=args.no_create_folders,
+                no_create_folders=no_create,
                 progress=mux,
             )
             console.print(f"[green]uploaded[/green] {len(result)} files to {remote}")
@@ -285,7 +287,7 @@ def command_upload(args: argparse.Namespace) -> int:
                 workers=args.workers,
                 part_size=args.part_size,
                 checksum=not args.no_sha256,
-                no_create_folders=args.no_create_folders,
+                no_create_folders=no_create,
                 progress=mux,
             )
             console.print(f"[green]uploaded[/green] {node.path} ({node.size})")
@@ -443,6 +445,12 @@ def build_parser() -> argparse.ArgumentParser:
         "--no-create-folders",
         action="store_true",
         help="Assume target folders already exist; skip all createFolder calls (fails if a parent is missing).",
+    )
+    upload_cmd.add_argument(
+        "--fast",
+        action="store_true",
+        help="Maximum speed: assume the remote tree already exists and skip ALL control-plane probes "
+        "(folder existence, skip-existing size checks). Equivalent to --no-create-folders without --skip-existing.",
     )
     upload_cmd.set_defaults(func=command_upload)
 
