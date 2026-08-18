@@ -943,7 +943,12 @@ class DiskBlazeClient:
                     marker = ws_url.find("/api/upload-ws?")
                     if marker >= 0:
                         ws_url = override + ws_url[marker:]
-                connection = websocket.create_connection(ws_url, timeout=self.timeout, enable_multithread=False)
+                connection_args = {"timeout": self.timeout, "enable_multithread": False}
+                if override:
+                    # SSH/private tunnels terminate locally, but the gateway
+                    # still validates its public virtual host.
+                    connection_args["host"] = os.environ.get("DISKBLAZE_GATEWAY_WS_HOST", "gw.diskblaze.com")
+                connection = websocket.create_connection(ws_url, **connection_args)
                 try:
                     for chunk in body:
                         if chunk:
