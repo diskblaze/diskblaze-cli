@@ -38,7 +38,24 @@ diskblaze url /private/movie.mkv --expires 604800   # signed link
 ```
 
 Run `diskblaze <command> --help` for all options. `--workers` and
-`--file-workers` tune upload/download concurrency.
+`--file-workers` tune upload/download concurrency. The defaults are tuned for
+reliability: `8` streams per large file and `4` concurrent files. For a large
+folder, the client walks the source lazily and keeps only active files in its
+queue, so it can upload very large trees without a long planning pause or a
+large memory spike.
+
+The supported API endpoint is `https://diskblaze.com/graphql`. Older saved
+configuration pointing at the retired GraphQL host is automatically upgraded
+to the supported endpoint. Transport failures, rate limits, and server errors
+are retried with a fresh connection; permission and path errors fail
+immediately with their server message.
+
+For a controlled high-concurrency folder upload:
+
+```bash
+diskblaze upload ./archive /public/archive \
+  --file-workers 8 --workers 4 --max-inflight 8
+```
 
 ## Python
 

@@ -5,10 +5,10 @@ import os
 import posixpath
 import threading
 import time
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, as_completed, wait
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Callable, Iterable
+from typing import Callable, Iterable, Iterator
 from urllib.parse import urlparse
 
 import requests
@@ -18,6 +18,8 @@ from tenacity import retry, retry_if_exception_type, stop_after_attempt, wait_ex
 
 DEFAULT_ENDPOINT = "https://diskblaze.com/graphql"
 MiB = 1024 * 1024
+GRAPHQL_ATTEMPTS = 5
+RETIRED_GQL_HOSTS = frozenset({"gql.hostingsolutions.top"})
 
 
 class DiskBlazeError(RuntimeError):
@@ -133,10 +135,11 @@ mutation CreateFolder($path: String!) {
 """
 
 FILES = """
-query Files($path: String!) {
-  files(path: $path) {
+query Files($path: String!, $limit: Int, $offset: Int) {
+  files(path: $path, limit: $limit, offset: $offset) {
     path
     parent
+    hasMore
     items { id name path parentPath isDir sizeBytes size updatedAt readonly contentSha256 }
   }
 }
@@ -220,12 +223,21 @@ def join_remote(parent: str, name: str) -> str:
 
 
 def preferred_part_size(size: int) -> int | None:
-    if size >= 8 * 1024 * MiB:
-        return 256 * MiB
-    if size >= 1024 * MiB:
-        return 128 * MiB
-    if size >= 64 * MiB:
+    """Choose parts that leave enough parallelism for the gateway.
+
+    A single 64 MiB PUT is materially slower than several smaller multipart
+    PUTs on the production path. Keep medium files at 8 MiB parts so the
+    default eight workers can actually fill the connection pool, then grow
+    parts only once there are already plenty of concurrent parts available.
+    """
+    if size >= 2 * 1024 * MiB:
         return 64 * MiB
+    if size >= 512 * MiB:
+        return 32 * MiB
+    if size >= 128 * MiB:
+        return 16 * MiB
+    if size >= 8 * MiB:
+        return 8 * MiB
     return None
 
 
@@ -305,7 +317,7 @@ class DiskBlazeClient:
         timeout: float = 120.0,
         pool_size: int = 64,
     ):
-        self.endpoint = (endpoint or os.environ.get("DISKBLAZE_GQL_URL") or DEFAULT_ENDPOINT).rstrip("/")
+        self.endpoint = endpoint_from_base(endpoint or os.environ.get("DISKBLAZE_GQL_URL") or DEFAULT_ENDPOINT)
         self.token = token or os.environ.get("DISKBLAZE_TOKEN") or os.environ.get("DISKBLAZE_API_KEY")
         if not self.token:
             raise DiskBlazeError("DISKBLAZE_TOKEN or DISKBLAZE_API_KEY is required")
@@ -314,6 +326,9 @@ class DiskBlazeClient:
         self._headers = {"Authorization": f"Bearer {self.token}"}
         self._local = threading.local()
         self.session = self._new_session()
+        self._local.session = self.session
+        self._folder_lock = threading.RLock()
+        self._ensured_folders = {"/", "/private", "/public", "/inbox", "/shared"}
 
     def _new_session(self) -> requests.Session:
         session = requests.Session()
@@ -335,31 +350,89 @@ class DiskBlazeClient:
             self._local.session = session
         return session
 
-    @retry(
-        retry=retry_if_exception_type((requests.RequestException, DiskBlazeError)),
-        wait=wait_exponential_jitter(initial=0.5, max=8),
-        stop=stop_after_attempt(4),
-        reraise=True,
-    )
+    def _discard_session(self) -> None:
+        """Drop a failed connection pool before retrying a transfer.
+
+        A proxy can reset one HTTP/2 stream while leaving the client library's
+        pool alive. Retrying through that same pool can then repeatedly select
+        the bad connection. Transfer retries must start with a new transport.
+        """
+        session = getattr(self._local, "session", None)
+        self._local.session = None
+        if session is not None:
+            try:
+                session.close()
+            except Exception:
+                pass
+
     def graphql(self, query: str, variables: dict | None = None) -> dict:
-        response = self._session().post(
-            self.endpoint,
-            json={"query": query, "variables": variables or {}},
-            timeout=self.timeout,
+        """Execute GraphQL with retries limited to temporary transport faults.
+
+        Retrying application errors makes a missing folder or a denied request
+        appear as a hung CLI. Only connection failures, 429s, and 5xx responses
+        are retried, and each retry uses a fresh keep-alive pool.
+        """
+        last_error: Exception | None = None
+        for attempt in range(GRAPHQL_ATTEMPTS):
+            response: requests.Response | None = None
+            try:
+                response = self._session().post(
+                    self.endpoint,
+                    json={"query": query, "variables": variables or {}},
+                    timeout=self.timeout,
+                )
+                if response.status_code >= 400:
+                    if response.status_code not in {408, 425, 429} and response.status_code < 500:
+                        raise DiskBlazeError(f"GraphQL request failed ({response.status_code})")
+                    retry_after = response.headers.get("Retry-After")
+                    raise _TransientRequestError(
+                        f"GraphQL request failed ({response.status_code})",
+                        retry_after=retry_after,
+                    )
+                payload = response.json()
+            except _TransientRequestError as exc:
+                last_error = exc
+                delay = exc.retry_after
+            except (requests.RequestException, ValueError) as exc:
+                last_error = exc
+                delay = None
+            else:
+                if payload.get("errors"):
+                    errors = payload["errors"]
+                    message = errors[0].get("message") if isinstance(errors, list) and errors else str(errors)
+                    raise DiskBlazeError(message or "GraphQL request failed")
+                data = payload.get("data")
+                if not isinstance(data, dict):
+                    raise DiskBlazeError("GraphQL response did not include data")
+                return data
+
+            if attempt == GRAPHQL_ATTEMPTS - 1:
+                break
+            self._discard_session()
+            if delay is None:
+                delay = min(8.0, 0.5 * (2**attempt))
+            time.sleep(max(0.0, min(delay, 30.0)))
+        raise DiskBlazeError(f"GraphQL request failed after {GRAPHQL_ATTEMPTS} attempts: {last_error}") from last_error
+
+    def list_files_page(self, path: str = "/", *, limit: int = 200, offset: int = 0) -> tuple[list[FileNode], bool]:
+        data = self.graphql(
+            FILES,
+            {"path": normalize_remote_path(path), "limit": max(1, int(limit)), "offset": max(0, int(offset))},
         )
-        response.raise_for_status()
-        payload = response.json()
-        if payload.get("errors"):
-            message = payload["errors"][0].get("message") if isinstance(payload["errors"], list) else str(payload["errors"])
-            raise DiskBlazeError(message or "GraphQL request failed")
-        data = payload.get("data")
-        if not isinstance(data, dict):
-            raise DiskBlazeError("GraphQL response did not include data")
-        return data
+        listing = data["files"]
+        return [_node_from_payload(item) for item in listing["items"]], bool(listing.get("hasMore"))
 
     def list_files(self, path: str = "/") -> list[FileNode]:
-        data = self.graphql(FILES, {"path": normalize_remote_path(path)})
-        return [_node_from_payload(item) for item in data["files"]["items"]]
+        return self.list_files_page(path)[0]
+
+    def iter_files(self, path: str = "/", *, page_size: int = 200) -> Iterator[FileNode]:
+        offset = 0
+        while True:
+            items, has_more = self.list_files_page(path, limit=page_size, offset=offset)
+            yield from items
+            if not has_more or not items:
+                return
+            offset += len(items)
 
     def me(self) -> CurrentUser:
         data = self.graphql(ME)
@@ -401,15 +474,18 @@ class DiskBlazeClient:
 
     def ensure_folder(self, path: str) -> None:
         normalized = normalize_remote_path(path)
-        if normalized in {"/", "/private", "/public", "/inbox", "/shared"}:
-            return
-        current = ""
-        for part in normalized.strip("/").split("/"):
-            current = f"{current}/{part}"
-            try:
+        with self._folder_lock:
+            if normalized in self._ensured_folders:
+                return
+            current = ""
+            for part in normalized.strip("/").split("/"):
+                current = f"{current}/{part}"
+                if current in self._ensured_folders:
+                    continue
+                # createFolder is idempotent server-side. Do not mask errors:
+                # permission and availability failures must stop the upload.
                 self.create_folder(current)
-            except Exception:
-                pass
+                self._ensured_folders.add(current)
 
     def move(self, src: str, dst: str) -> FileNode:
         data = self.graphql(
@@ -520,6 +596,7 @@ class DiskBlazeClient:
                         self._put_stream(plan.put_url, reader, length=size)
                     break
                 except requests.RequestException:
+                    self._discard_session()
                     if attempt == 3:
                         raise
                     time.sleep(min(8.0, 0.5 * (2 ** attempt)))
@@ -565,51 +642,82 @@ class DiskBlazeClient:
         file_workers: int = 2,
         checksum: bool = False,
         progress: ProgressCallback | None = None,
-    ) -> list[FileNode]:
+        max_inflight: int | None = None,
+        collect_results: bool = True,
+    ) -> list[FileNode] | int:
         root = Path(local_path)
         if root.is_file():
-            return [self.upload_file(root, join_remote(remote_dir, root.name), workers=workers, checksum=checksum, progress=progress)]
-        files = [path for path in root.rglob("*") if path.is_file()]
-        dirs = {normalize_remote_path(remote_dir)}
-        for dir_path in (path for path in root.rglob("*") if path.is_dir()):
-            dirs.add(join_remote(remote_dir, dir_path.relative_to(root).as_posix()))
-        for file_path in files:
-            parent = file_path.relative_to(root).parent.as_posix()
-            if parent and parent != ".":
-                dirs.add(join_remote(remote_dir, parent))
-        for remote_folder in sorted(dirs, key=lambda item: item.count("/")):
-            self.ensure_folder(remote_folder)
+            result = self.upload_file(root, join_remote(remote_dir, root.name), workers=workers, checksum=checksum, progress=progress)
+            return [result] if collect_results else 1
+        if not root.is_dir():
+            raise DiskBlazeError(f"local path is not a file or directory: {root}")
+
+        remote_root = normalize_remote_path(remote_dir)
+        self.ensure_folder(remote_root)
+        file_workers = max(1, int(file_workers))
+        # Keep the queue bounded for very large source trees. This is separate
+        # from active workers, so a directory with millions of files does not
+        # consume RAM or flood GraphQL planning requests.
+        max_inflight = max(file_workers, int(max_inflight or file_workers))
+        # A folder upload has a global PUT budget. Without it, every file can
+        # open its own multipart pool and exhaust the gateway.
+        per_file_workers = max(1, min(int(workers), max(1, 16 // file_workers)))
         results: list[FileNode] = []
-        executor = ThreadPoolExecutor(max_workers=max(1, int(file_workers)), thread_name_prefix="diskblaze-file")
+        completed_count = 0
+        iterator = self._iter_tree_files(root)
+        executor = ThreadPoolExecutor(max_workers=file_workers, thread_name_prefix="diskblaze-file")
         failed = False
         try:
             futures = {}
-            for file_path in files:
-                rel = file_path.relative_to(root).as_posix()
-                remote_path = join_remote(remote_dir, rel)
-                futures[
-                    executor.submit(
+
+            def submit_until_full() -> None:
+                while len(futures) < max_inflight:
+                    try:
+                        file_path = next(iterator)
+                    except StopIteration:
+                        return
+                    rel = file_path.relative_to(root).as_posix()
+                    remote_path = join_remote(remote_root, rel)
+                    future = executor.submit(
                         self.upload_file,
                         file_path,
                         remote_path,
-                        workers=workers,
+                        workers=per_file_workers,
                         checksum=checksum,
-                        ensure_parent=False,
+                        ensure_parent=True,
                         progress=progress,
                     )
-                ] = file_path
-            for future in as_completed(futures):
-                file_path = futures[future]
-                try:
-                    results.append(future.result())
-                except Exception as exc:
-                    failed = True
-                    for pending in futures:
-                        pending.cancel()
-                    raise DiskBlazeError(f"upload failed for {file_path}: {exc}") from exc
+                    futures[future] = file_path
+
+            submit_until_full()
+            while futures:
+                done, _ = wait(futures, return_when=FIRST_COMPLETED)
+                for future in done:
+                    file_path = futures.pop(future)
+                    try:
+                        node = future.result()
+                    except Exception as exc:
+                        failed = True
+                        for pending in futures:
+                            pending.cancel()
+                        raise DiskBlazeError(f"upload failed for {file_path}: {exc}") from exc
+                    completed_count += 1
+                    if collect_results:
+                        results.append(node)
+                submit_until_full()
         finally:
             executor.shutdown(wait=not failed, cancel_futures=failed)
-        return results
+        return results if collect_results else completed_count
+
+    @staticmethod
+    def _iter_tree_files(root: Path) -> Iterator[Path]:
+        """Yield a tree lazily so large uploads never need a full pre-scan."""
+        for directory, _dirnames, filenames in os.walk(root):
+            base = Path(directory)
+            for filename in filenames:
+                candidate = base / filename
+                if candidate.is_file():
+                    yield candidate
 
     def download_url(self, path: str, *, expires_seconds: int = 3600) -> str:
         data = self.graphql(DOWNLOAD_URL, {"path": normalize_remote_path(path), "expiresSeconds": int(expires_seconds)})
@@ -664,7 +772,7 @@ class DiskBlazeClient:
         stack = [root_remote]
         while stack:
             folder = stack.pop()
-            for node in self.list_files(folder):
+            for node in self.iter_files(folder):
                 if node.is_dir:
                     stack.append(node.path)
                 else:
@@ -815,6 +923,7 @@ class DiskBlazeClient:
                 break
             except requests.RequestException as exc:
                 last_error = exc
+                self._discard_session()
                 if attempt == 3:
                     raise
                 time.sleep(min(8.0, 0.5 * (2 ** attempt)))
@@ -864,10 +973,21 @@ class DiskBlazeClient:
 
 
 def endpoint_from_base(value: str) -> str:
-    raw = value.strip()
+    raw = value.strip().rstrip("/")
+    parsed = urlparse(raw)
+    if parsed.hostname and parsed.hostname.lower() in RETIRED_GQL_HOSTS:
+        return DEFAULT_ENDPOINT
     if raw.endswith("/graphql"):
         return raw
-    parsed = urlparse(raw)
     if parsed.scheme and parsed.netloc:
         return raw.rstrip("/") + "/graphql"
     return raw
+
+
+class _TransientRequestError(requests.RequestException):
+    def __init__(self, message: str, *, retry_after: str | None = None):
+        super().__init__(message)
+        try:
+            self.retry_after = float(retry_after) if retry_after is not None else None
+        except (TypeError, ValueError):
+            self.retry_after = None

@@ -261,8 +261,10 @@ def command_upload(args: argparse.Namespace) -> int:
                 file_workers=args.file_workers,
                 checksum=not args.no_sha256,
                 progress=mux,
+                max_inflight=args.max_inflight,
+                collect_results=False,
             )
-            console.print(f"[green]uploaded[/green] {len(result)} files to {remote}")
+            console.print(f"[green]uploaded[/green] {result} files to {remote}")
         else:
             node = client.upload_file(
                 local,
@@ -308,8 +310,11 @@ def command_download(args: argparse.Namespace) -> int:
 def add_common(parser: argparse.ArgumentParser, *, suppress_defaults: bool = False) -> None:
     default = argparse.SUPPRESS if suppress_defaults else None
     timeout_default = argparse.SUPPRESS if suppress_defaults else 120.0
-    workers_default = argparse.SUPPRESS if suppress_defaults else 64
-    file_workers_default = argparse.SUPPRESS if suppress_defaults else 8
+    # These values are deliberately conservative. Folder uploads also enforce
+    # a global gateway PUT budget, preventing many small files from turning
+    # into hundreds of simultaneous GraphQL plans and upload streams.
+    workers_default = argparse.SUPPRESS if suppress_defaults else 8
+    file_workers_default = argparse.SUPPRESS if suppress_defaults else 4
     parser.add_argument("--endpoint", default=default, help="GraphQL endpoint or DiskBlaze base URL. Default: https://diskblaze.com/graphql")
     parser.add_argument("--token", default=default, help="API key. Default: saved login, DISKBLAZE_TOKEN, or DISKBLAZE_API_KEY")
     parser.add_argument("--timeout", type=float, default=timeout_default)
@@ -384,6 +389,12 @@ def build_parser() -> argparse.ArgumentParser:
     upload_cmd.add_argument("local")
     upload_cmd.add_argument("remote", nargs="?")
     upload_cmd.add_argument("--part-size", type=int, default=None, help="Override multipart part size in bytes.")
+    upload_cmd.add_argument(
+        "--max-inflight",
+        type=int,
+        default=None,
+        help="Maximum planned folder files held in the local queue. Default: --file-workers.",
+    )
     upload_cmd.add_argument(
         "--no-sha256",
         action="store_true",
