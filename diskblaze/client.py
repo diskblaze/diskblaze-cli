@@ -571,6 +571,13 @@ class DiskBlazeClient:
             self.ensure_folder(parent)
         sha256 = self.sha256(path, progress_path=remote, total=size, progress=progress) if checksum else None
         plan = self.create_upload_plan(remote, size_bytes=size, content_sha256=sha256, part_size=part_size)
+        # Empty files have no body to stream. The control plane creates an
+        # empty-object plan without multipart parts; sending an iterable with
+        # a zero Content-Length through the gateway is rejected by some HTTP
+        # proxies. Finalize the plan directly instead.
+        if size == 0:
+            progress and progress(TransferProgress(remote, 0, 0, "completing", 0))
+            return self.complete_upload(plan.token, content_sha256=sha256 or None)
         started = time.monotonic()
         transferred = 0
         lock = threading.Lock()

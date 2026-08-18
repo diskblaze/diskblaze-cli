@@ -227,6 +227,19 @@ def test_upload_file_streams_bytes_and_sends_checksum(tmp_path: Path):
     assert node.content_sha256 == expected_sha
 
 
+def test_upload_file_finalizes_zero_byte_files_without_gateway_put(tmp_path: Path):
+    local = tmp_path / "empty.bin"
+    local.write_bytes(b"")
+    client = FakeUploadClient()
+
+    node = client.upload_file(local, "/private/up/empty.bin", checksum=False)
+
+    assert client.uploaded == b""
+    assert len(client.plan_requests) == 1
+    assert len(client.completed) == 1
+    assert node.size_bytes == 0
+
+
 def test_progress_reader_prepares_fixed_length_request(tmp_path: Path):
     local = tmp_path / "part.bin"
     local.write_bytes(b"x" * 1024)
