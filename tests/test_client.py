@@ -215,7 +215,7 @@ def test_upload_file_streams_bytes_and_sends_checksum(tmp_path: Path):
 
     expected_sha = hashlib.sha256(local.read_bytes()).hexdigest()
     assert bytes(client.uploaded) == local.read_bytes()
-    assert client.created_folders == ["/private/up"]
+    assert client.created_folders == []
     assert client.plan_requests[0]["content_sha256"] == expected_sha
     assert client.completed == [
         {

@@ -566,9 +566,10 @@ class DiskBlazeClient:
         path = Path(local_path)
         size = path.stat().st_size
         remote = normalize_remote_path(remote_path)
-        parent = posixpath.dirname(remote)
-        if ensure_parent and parent and parent != "/":
-            self.ensure_folder(parent)
+        # The control plane atomically materializes missing parent directories
+        # during completion. Avoid a createFolder round-trip per file: with a
+        # large tree that turns directory preparation into the bottleneck.
+        # Keep the argument for backwards-compatible callers.
         sha256 = self.sha256(path, progress_path=remote, total=size, progress=progress) if checksum else None
         plan = self.create_upload_plan(remote, size_bytes=size, content_sha256=sha256, part_size=part_size)
         # Empty files have no body to stream. The control plane creates an
