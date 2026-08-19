@@ -5,6 +5,7 @@ import os
 import posixpath
 import threading
 import time
+import json
 from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, as_completed, wait
 from dataclasses import dataclass
 from pathlib import Path
@@ -906,8 +907,25 @@ class DiskBlazeClient:
         return output
 
     def _put_stream(self, url: str, body: Iterable[bytes], *, length: int, progress: Callable[[int], None] | None = None) -> str:
-        # POST avoids the proxied-edge resets observed for long-lived upload
-        # PUTs. The gateway continues to issue a PUT to object storage.
+        if "/api/upload?" in url:
+            try:
+                import websocket
+
+                ws_url = url.replace("https://", "wss://", 1).replace("http://", "ws://", 1).replace("/api/upload?", "/api/upload-ws?", 1)
+                connection = websocket.create_connection(ws_url, timeout=self.timeout, enable_multithread=False)
+                try:
+                    for chunk in body:
+                        if chunk:
+                            connection.send(chunk, opcode=websocket.ABNF.OPCODE_BINARY)
+                    result = json.loads(connection.recv())
+                finally:
+                    connection.close()
+                if not result.get("ok"):
+                    raise requests.ConnectionError(str(result.get("error") or "gateway upload failed"))
+                return str(result.get("etag") or "").replace('"', "")
+            except ImportError:
+                pass
+        # Backwards-compatible fallback for callers without WebSocket support.
         response = self._session().post(url, data=body, headers={"Content-Length": str(int(length))}, timeout=self.timeout)
         response.raise_for_status()
         return response.headers.get("ETag", "").replace('"', "")
