@@ -6,6 +6,7 @@ import posixpath
 import threading
 import time
 import json
+import os
 from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, as_completed, wait
 from dataclasses import dataclass
 from pathlib import Path
@@ -935,6 +936,13 @@ class DiskBlazeClient:
                 import websocket
 
                 ws_url = url.replace("https://", "wss://", 1).replace("http://", "ws://", 1).replace("/api/upload?", "/api/upload-ws?", 1)
+                # Private edge relays keep the Beam credentials and presigned
+                # URLs off the client while avoiding a slow public ingress.
+                override = os.environ.get("DISKBLAZE_GATEWAY_WS_BASE", "").strip().rstrip("/")
+                if override:
+                    marker = ws_url.find("/api/upload-ws?")
+                    if marker >= 0:
+                        ws_url = override + ws_url[marker:]
                 connection = websocket.create_connection(ws_url, timeout=self.timeout, enable_multithread=False)
                 try:
                     for chunk in body:
