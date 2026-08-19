@@ -254,6 +254,9 @@ def command_upload(args: argparse.Namespace) -> int:
     with progress:
         mux = ProgressMux(progress)
         if local.is_dir():
+            def report_upload_error(path: Path, exc: Exception) -> None:
+                console.print(f"[yellow]skipped after retries:[/yellow] {path}: {exc}")
+
             result = client.upload_tree(
                 local,
                 remote,
@@ -263,6 +266,9 @@ def command_upload(args: argparse.Namespace) -> int:
                 progress=mux,
                 max_inflight=args.max_inflight,
                 collect_results=False,
+                retry_attempts=args.retry_attempts,
+                continue_on_error=args.continue_on_error,
+                on_error=report_upload_error,
             )
             console.print(f"[green]uploaded[/green] {result} files to {remote}")
         else:
@@ -399,6 +405,17 @@ def build_parser() -> argparse.ArgumentParser:
         "--no-sha256",
         action="store_true",
         help="Skip the local SHA-256 pre-read. Faster to start, but the server may need a backend readback.",
+    )
+    upload_cmd.add_argument(
+        "--retry-attempts",
+        type=int,
+        default=4,
+        help="Attempts per file before reporting failure.",
+    )
+    upload_cmd.add_argument(
+        "--continue-on-error",
+        action="store_true",
+        help="Keep a folder upload running after a file exhausts its retries.",
     )
     upload_cmd.set_defaults(func=command_upload)
 

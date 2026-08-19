@@ -653,6 +653,9 @@ class DiskBlazeClient:
         progress: ProgressCallback | None = None,
         max_inflight: int | None = None,
         collect_results: bool = True,
+        retry_attempts: int = 1,
+        continue_on_error: bool = False,
+        on_error: Callable[[Path, Exception], None] | None = None,
     ) -> list[FileNode] | int:
         root = Path(local_path)
         if root.is_file():
@@ -679,6 +682,29 @@ class DiskBlazeClient:
         try:
             futures = {}
 
+            def upload_with_retry(file_path: Path, remote_path: str) -> FileNode | None:
+                last_error: Exception | None = None
+                for attempt in range(max(1, int(retry_attempts))):
+                    try:
+                        return self.upload_file(
+                            file_path,
+                            remote_path,
+                            workers=per_file_workers,
+                            checksum=checksum,
+                            ensure_parent=True,
+                            progress=progress,
+                        )
+                    except Exception as exc:
+                        last_error = exc
+                        if attempt + 1 < max(1, int(retry_attempts)):
+                            time.sleep(min(0.5 * (2**attempt), 8.0))
+                assert last_error is not None
+                if continue_on_error:
+                    if on_error:
+                        on_error(file_path, last_error)
+                    return None
+                raise last_error
+
             def submit_until_full() -> None:
                 while len(futures) < max_inflight:
                     try:
@@ -688,13 +714,9 @@ class DiskBlazeClient:
                     rel = file_path.relative_to(root).as_posix()
                     remote_path = join_remote(remote_root, rel)
                     future = executor.submit(
-                        self.upload_file,
+                        upload_with_retry,
                         file_path,
                         remote_path,
-                        workers=per_file_workers,
-                        checksum=checksum,
-                        ensure_parent=True,
-                        progress=progress,
                     )
                     futures[future] = file_path
 
@@ -710,8 +732,9 @@ class DiskBlazeClient:
                         for pending in futures:
                             pending.cancel()
                         raise DiskBlazeError(f"upload failed for {file_path}: {exc}") from exc
-                    completed_count += 1
-                    if collect_results:
+                    if node is not None:
+                        completed_count += 1
+                    if collect_results and node is not None:
                         results.append(node)
                 submit_until_full()
         finally:
