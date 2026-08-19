@@ -906,7 +906,9 @@ class DiskBlazeClient:
         return output
 
     def _put_stream(self, url: str, body: Iterable[bytes], *, length: int, progress: Callable[[int], None] | None = None) -> str:
-        response = self._session().put(url, data=body, headers={"Content-Length": str(int(length))}, timeout=self.timeout)
+        # POST avoids the proxied-edge resets observed for long-lived upload
+        # PUTs. The gateway continues to issue a PUT to object storage.
+        response = self._session().post(url, data=body, headers={"Content-Length": str(int(length))}, timeout=self.timeout)
         response.raise_for_status()
         return response.headers.get("ETag", "").replace('"', "")
 
